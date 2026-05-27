@@ -1,0 +1,7 @@
+target/
+.bloop/
+.metals/
+.idea/
+*.class
+*.log
+C:\spherechat_uploads\
