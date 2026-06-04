@@ -100,7 +100,7 @@ builder.Services.AddSingleton<ILegacyTokenService>(new LegacyJwtTokenService(jwt
 builder.Services.AddSingleton<IApiKeyValidator>(new DummyApiKeyValidator());
 
 // --- Repositorios (SCOPED — cada request abre/cierra su propia conexión) ---
-builder.Services.AddScoped<IMessageRepository>(_ => new NpgsqlMessageRepository(chatDbConnStr));
+builder.Services.AddScoped<IMessageRepository>(sp => new NpgsqlMessageRepository(chatDbConnStr, sp.GetRequiredService<IConnectionMultiplexer>()));
 builder.Services.AddScoped<IAuthUserRepository>(_ => new NpgsqlAuthUserRepository(chatDbConnStr));
 builder.Services.AddScoped<IUserRepository>(_ => new NpgsqlUserRepository(legacyDbConnStr));
 builder.Services.AddScoped<ICapacitacionRepository>(_ => new NpgsqlCapacitacionRepository(legacyDbConnStr));

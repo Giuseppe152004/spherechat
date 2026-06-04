@@ -94,19 +94,19 @@ public class CallHub : Hub
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
 
-            int status = isOnline ? 0 : 3;
-            string statusStr = isOnline ? "Online" : "Offline";
-
-            // Update DB
             string sql = isOnline 
-                ? @"UPDATE ""credentials"".""users"" SET is_online = true, status = 0 WHERE id = @id RETURNING avatar_url;"
-                : @"UPDATE ""credentials"".""users"" SET is_online = false, status = 3, last_seen = now() WHERE id = @id RETURNING avatar_url;";
+                ? @"UPDATE ""credentials"".""users"" SET is_online = true, status = CASE WHEN status = 3 THEN 0 ELSE status END WHERE id = @id RETURNING avatar_url, status;"
+                : @"UPDATE ""credentials"".""users"" SET is_online = false, status = 3, last_seen = now() WHERE id = @id RETURNING avatar_url, status;";
 
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("id", userId);
             
-            var avatarUrlObj = await cmd.ExecuteScalarAsync();
-            var avatarUrl = avatarUrlObj as string ?? "none";
+            await using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return;
+
+            var avatarUrl = reader.IsDBNull(0) ? "none" : reader.GetString(0);
+            var actualStatus = reader.IsDBNull(1) ? (short)(isOnline ? 0 : 3) : reader.GetInt16(1);
+            
             if (!string.IsNullOrEmpty(avatarUrl) && avatarUrl != "none")
             {
                 avatarUrl = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(avatarUrl));
@@ -116,6 +116,13 @@ public class CallHub : Hub
                 avatarUrl = "none";
             }
 
+            string statusStr = actualStatus switch {
+                1 => "Away",
+                2 => "DoNotDisturb",
+                3 => "Offline",
+                _ => "Online"
+            };
+
             // Payload format: "userId:isOnline:userStatus:avatarUrlBase64"
             string presencePayload = $"{userId}:{isOnline.ToString().ToLower()}:{statusStr}:{avatarUrl}";
 
@@ -123,7 +130,6 @@ public class CallHub : Hub
             await _eventPublisher.PublishAsync("sphere_updates", "USER_PRESENCE", presencePayload);
 
             // ── NOTIFY sanitizado para retrocompatibilidad con ChatNexus Desktop ──
-            // Se usa parámetro para evitar inyección SQL (Auditoría §5)
             var notifyJson = JsonSerializer.Serialize(new { Type = "USER_PRESENCE", Payload = presencePayload });
             await using var notifyCmd = new NpgsqlCommand("SELECT pg_notify('sphere_updates', @payload)", conn);
             notifyCmd.Parameters.AddWithValue("payload", notifyJson);
