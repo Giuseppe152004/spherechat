@@ -19,13 +19,20 @@ public class CallHub : Hub
 {
     private readonly ICallSessionTracker _tracker;
     private readonly ISendMessageUseCase _sendMessage;
+    private readonly IEventPublisher _eventPublisher;
     private readonly ILogger<CallHub> _logger;
     private readonly string _connectionString;
 
-    public CallHub(ICallSessionTracker tracker, ISendMessageUseCase sendMessage, ILogger<CallHub> logger, IConfiguration configuration)
+    public CallHub(
+        ICallSessionTracker tracker,
+        ISendMessageUseCase sendMessage,
+        IEventPublisher eventPublisher,
+        ILogger<CallHub> logger,
+        IConfiguration configuration)
     {
         _tracker = tracker;
         _sendMessage = sendMessage;
+        _eventPublisher = eventPublisher;
         _logger = logger;
         _connectionString = configuration.GetConnectionString("SphereDb") ?? configuration["Database:Chat"] ?? "";
     }
@@ -109,12 +116,17 @@ public class CallHub : Hub
                 avatarUrl = "none";
             }
 
-            // Notify Postgres
             // Payload format: "userId:isOnline:userStatus:avatarUrlBase64"
-            string payload = $"{userId}:{isOnline.ToString().ToLower()}:{statusStr}:{avatarUrl}";
-            var json = JsonSerializer.Serialize(new { Type = "USER_PRESENCE", Payload = payload });
-            
-            await using var notifyCmd = new NpgsqlCommand($"NOTIFY sphere_updates, '{json}'", conn);
+            string presencePayload = $"{userId}:{isOnline.ToString().ToLower()}:{statusStr}:{avatarUrl}";
+
+            // ── Publicar en Redis Pub/Sub (nuevo — Auditoría §5) ──
+            await _eventPublisher.PublishAsync("sphere_updates", "USER_PRESENCE", presencePayload);
+
+            // ── NOTIFY sanitizado para retrocompatibilidad con ChatNexus Desktop ──
+            // Se usa parámetro para evitar inyección SQL (Auditoría §5)
+            var notifyJson = JsonSerializer.Serialize(new { Type = "USER_PRESENCE", Payload = presencePayload });
+            await using var notifyCmd = new NpgsqlCommand("SELECT pg_notify('sphere_updates', @payload)", conn);
+            notifyCmd.Parameters.AddWithValue("payload", notifyJson);
             await notifyCmd.ExecuteNonQueryAsync();
 
             _logger.LogInformation("📢 Presence updated for User {UserId}: {Status}", userId, statusStr);

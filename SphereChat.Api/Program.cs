@@ -1,25 +1,37 @@
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
-
 using Scalar.AspNetCore;
+using StackExchange.Redis;
 using SphereChat.Api.Application.Ports.In;
 using SphereChat.Api.Application.Ports.Out;
 using SphereChat.Api.Application.Services;
 using SphereChat.Api.Infrastructure.Http.Hubs;
 using SphereChat.Api.Infrastructure.Postgres;
+using SphereChat.Api.Infrastructure.Redis;
 using SphereChat.Api.Infrastructure.Security;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // ═══════════════════════════════════════════════════════════════════
-// 1. Configuración de Connection Strings
+// 1. Configuración — SIN fallbacks hardcodeados (Auditoría §3)
 // ═══════════════════════════════════════════════════════════════════
-var jwtSecret = builder.Configuration["Jwt:Secret"] ?? "mi-api-scala-secreto-desarrollo-2026";
+var jwtSecret = builder.Configuration["Jwt:Secret"]
+    ?? throw new InvalidOperationException(
+        "FATAL: 'Jwt:Secret' no está configurado en appsettings.json. " +
+        "La API no puede arrancar sin un secreto JWT seguro.");
+
 var chatDbConnStr = builder.Configuration["Database:Chat"]
-    ?? "Host=10.10.40.247;Port=5432;Database=sphere;Username=patricia;Password=123456;";
+    ?? throw new InvalidOperationException(
+        "FATAL: 'Database:Chat' no está configurado en appsettings.json.");
+
 var legacyDbConnStr = builder.Configuration["Database:Legacy"]
-    ?? "Host=142.44.158.217;Port=5432;Database=ecosystem_dev;Username=api_training_user;Password=Pepeluchoelquetequieremucho;Search Path=training_dev;";
+    ?? throw new InvalidOperationException(
+        "FATAL: 'Database:Legacy' no está configurado en appsettings.json.");
+
+var redisConnStr = builder.Configuration.GetConnectionString("Redis")
+    ?? throw new InvalidOperationException(
+        "FATAL: 'ConnectionStrings:Redis' no está configurado en appsettings.json.");
 
 // ═══════════════════════════════════════════════════════════════════
 // 2. JWT Authentication (compatible con el JwtService de Scala)
@@ -55,34 +67,65 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization();
 
 // ═══════════════════════════════════════════════════════════════════
-// 3. Dependency Injection — Arquitectura Hexagonal (Ports & Adapters)
+// 3. Redis — Caché Distribuida + Pub/Sub + Backplane SignalR
+//    (Auditoría §2 + §5)
 // ═══════════════════════════════════════════════════════════════════
 
-// --- Seguridad ---
+// 3a. Caché distribuida Redis
+builder.Services.AddStackExchangeRedisCache(options =>
+{
+    options.Configuration = redisConnStr;
+    options.InstanceName = "SphereChat:";
+});
+
+// 3b. ConnectionMultiplexer compartido (thread-safe, singleton)
+builder.Services.AddSingleton<IConnectionMultiplexer>(sp =>
+{
+    var config = ConfigurationOptions.Parse(redisConnStr);
+    config.AbortOnConnectFail = false;
+    return ConnectionMultiplexer.Connect(config);
+});
+
+// 3c. Pub/Sub — Puerto de publicación de eventos
+builder.Services.AddSingleton<IEventPublisher, RedisEventPublisher>();
+
+// ═══════════════════════════════════════════════════════════════════
+// 4. Dependency Injection — Arquitectura Hexagonal (Ports & Adapters)
+//    Auditoría §1: Singleton → Scoped para repos con conexiones DB
+// ═══════════════════════════════════════════════════════════════════
+
+// --- Seguridad (Singleton OK — sin estado mutable, sin DB) ---
 builder.Services.AddSingleton<IJwtService>(new JwtService(jwtSecret, 24));
 builder.Services.AddSingleton<ILegacyTokenService>(new LegacyJwtTokenService(jwtSecret));
 builder.Services.AddSingleton<IApiKeyValidator>(new DummyApiKeyValidator());
 
-// --- Repositorios (Chat DB — sphere) ---
-builder.Services.AddSingleton<IMessageRepository>(new NpgsqlMessageRepository(chatDbConnStr));
-builder.Services.AddSingleton<IAuthUserRepository>(new NpgsqlAuthUserRepository(chatDbConnStr));
+// --- Repositorios (SCOPED — cada request abre/cierra su propia conexión) ---
+builder.Services.AddScoped<IMessageRepository>(_ => new NpgsqlMessageRepository(chatDbConnStr));
+builder.Services.AddScoped<IAuthUserRepository>(_ => new NpgsqlAuthUserRepository(chatDbConnStr));
+builder.Services.AddScoped<IUserRepository>(_ => new NpgsqlUserRepository(legacyDbConnStr));
+builder.Services.AddScoped<ICapacitacionRepository>(_ => new NpgsqlCapacitacionRepository(legacyDbConnStr));
 
-// --- Repositorios (Legacy DB — ecosystem_dev) ---
-builder.Services.AddSingleton<IUserRepository>(new NpgsqlUserRepository(legacyDbConnStr));
-builder.Services.AddSingleton<ICapacitacionRepository>(new NpgsqlCapacitacionRepository(legacyDbConnStr));
+// --- Servicios de Aplicación (SCOPED — dependen de repos Scoped) ---
+builder.Services.AddScoped<ISendMessageUseCase, SendMessageService>();
+builder.Services.AddScoped<LoginService>();
+builder.Services.AddScoped<LegacyAuthService>();
+builder.Services.AddScoped<CapacitacionService>();
 
-// --- Servicios de Aplicación ---
-builder.Services.AddSingleton<ISendMessageUseCase, SendMessageService>();
-builder.Services.AddSingleton<LoginService>();
-builder.Services.AddSingleton<LegacyAuthService>();
-builder.Services.AddSingleton<CapacitacionService>();
+// --- Tracking de llamadas (SINGLETON — ConcurrentDictionary thread-safe) ---
 builder.Services.AddSingleton<ICallSessionTracker, CallSessionTracker>();
 
 // ═══════════════════════════════════════════════════════════════════
-// 4. Controladores + SignalR + OpenAPI + CORS
+// 5. Controladores + SignalR (con Redis Backplane) + OpenAPI + CORS
 // ═══════════════════════════════════════════════════════════════════
 builder.Services.AddControllers();
-builder.Services.AddSignalR();
+
+// SignalR con Redis Backplane para escalabilidad multi-instancia
+builder.Services.AddSignalR()
+    .AddStackExchangeRedis(redisConnStr, options =>
+    {
+        options.Configuration.ChannelPrefix = RedisChannel.Literal("SphereChat");
+    });
+
 builder.Services.AddOpenApi();
 
 builder.Services.AddCors(options =>
@@ -96,7 +139,7 @@ builder.Services.AddCors(options =>
 });
 
 // ═══════════════════════════════════════════════════════════════════
-// 5. Build & Configure Middleware Pipeline
+// 6. Build & Configure Middleware Pipeline
 // ═══════════════════════════════════════════════════════════════════
 var app = builder.Build();
 
@@ -120,7 +163,7 @@ app.MapControllers();
 app.MapHub<CallHub>("/hubs/call");
 
 // ═══════════════════════════════════════════════════════════════════
-// 6. Configurar puerto y arranque
+// 7. Configurar puerto y arranque
 // ═══════════════════════════════════════════════════════════════════
 var uploadDir = builder.Configuration["Upload:Directory"] ?? @"C:\spherechat_uploads";
 var publicBaseUrl = Environment.GetEnvironmentVariable("PUBLIC_API_URL")
@@ -140,6 +183,8 @@ app.Lifetime.ApplicationStarted.Register(() =>
     Console.WriteLine($"📁 Archivos estáticos servidos desde: {Path.GetFullPath(uploadDir)}");
     Console.WriteLine($"📤 Endpoint de Upload: POST {publicBaseUrl}/api/v1/chat/upload");
     Console.WriteLine($"📜 Historial: GET {publicBaseUrl}/api/v1/chat/rooms/{{roomId}}/messages");
+    Console.WriteLine($"🔴 Redis conectado a: {redisConnStr}");
+    Console.WriteLine($"🔁 SignalR Backplane: Redis ({redisConnStr})");
 });
 
 app.Run();
