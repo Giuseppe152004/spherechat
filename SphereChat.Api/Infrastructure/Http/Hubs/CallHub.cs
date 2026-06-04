@@ -94,13 +94,13 @@ public class CallHub : Hub
             await using var conn = new NpgsqlConnection(_connectionString);
             await conn.OpenAsync();
 
-            int status = isOnline ? 1 : 0;
+            int status = isOnline ? 0 : 3;
             string statusStr = isOnline ? "Online" : "Offline";
 
             // Update DB
             string sql = isOnline 
-                ? @"UPDATE ""credentials"".""users"" SET is_online = true, status = 1 WHERE id = @id RETURNING avatar_url;"
-                : @"UPDATE ""credentials"".""users"" SET is_online = false, status = 0, last_seen = now() WHERE id = @id RETURNING avatar_url;";
+                ? @"UPDATE ""credentials"".""users"" SET is_online = true, status = 0 WHERE id = @id RETURNING avatar_url;"
+                : @"UPDATE ""credentials"".""users"" SET is_online = false, status = 3, last_seen = now() WHERE id = @id RETURNING avatar_url;";
 
             await using var cmd = new NpgsqlCommand(sql, conn);
             cmd.Parameters.AddWithValue("id", userId);
