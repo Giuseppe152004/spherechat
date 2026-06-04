@@ -1,7 +1,7 @@
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.IdentityModel.Tokens;
-using Microsoft.OpenApi.Models;
+
 using Scalar.AspNetCore;
 using SphereChat.Api.Application.Ports.In;
 using SphereChat.Api.Application.Ports.Out;

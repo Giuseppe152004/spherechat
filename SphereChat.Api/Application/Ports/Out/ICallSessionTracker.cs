@@ -5,7 +5,7 @@ namespace SphereChat.Api.Application.Ports.Out;
 /// </summary>
 public interface ICallSessionTracker
 {
-    void UserConnected(long userId, string connectionId);
-    void UserDisconnected(string connectionId);
+    bool UserConnected(long userId, string connectionId);
+    long? UserDisconnected(string connectionId);
     string? GetConnectionIdForUser(long userId);
 }

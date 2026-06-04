@@ -3,6 +3,8 @@ using Microsoft.AspNetCore.SignalR;
 using SphereChat.Api.Application.Ports.In;
 using SphereChat.Api.Application.Ports.Out;
 using System.Security.Claims;
+using Npgsql;
+using System.Text.Json;
 
 namespace SphereChat.Api.Infrastructure.Http.Hubs;
 
@@ -18,12 +20,14 @@ public class CallHub : Hub
     private readonly ICallSessionTracker _tracker;
     private readonly ISendMessageUseCase _sendMessage;
     private readonly ILogger<CallHub> _logger;
+    private readonly string _connectionString;
 
-    public CallHub(ICallSessionTracker tracker, ISendMessageUseCase sendMessage, ILogger<CallHub> logger)
+    public CallHub(ICallSessionTracker tracker, ISendMessageUseCase sendMessage, ILogger<CallHub> logger, IConfiguration configuration)
     {
         _tracker = tracker;
         _sendMessage = sendMessage;
         _logger = logger;
+        _connectionString = configuration.GetConnectionString("SphereDb") ?? configuration["Database:Chat"] ?? "";
     }
 
     private long GetUserId()
@@ -43,26 +47,82 @@ public class CallHub : Hub
     // Conexión / Desconexión
     // ════════════════════════════════════════════════════════════
 
-    public override Task OnConnectedAsync()
+    public override async Task OnConnectedAsync()
     {
         var userId = GetUserId();
         if (userId > 0)
         {
-            _tracker.UserConnected(userId, Context.ConnectionId);
+            var isFirstConnection = _tracker.UserConnected(userId, Context.ConnectionId);
             _logger.LogInformation("✅ SIGNALR CONNECTED: Usuario {UserId} conectado al hub de llamadas. ConnectionId: {ConnId}", userId, Context.ConnectionId);
+
+            if (isFirstConnection)
+            {
+                await UpdateUserPresenceAsync(userId, true);
+            }
         }
         else
         {
             _logger.LogWarning("❌ SIGNALR CONNECTED BUT UNAUTHENTICATED: Alguien se conectó pero no tiene userId. ConnectionId: {ConnId}", Context.ConnectionId);
         }
-        return base.OnConnectedAsync();
+        await base.OnConnectedAsync();
     }
 
-    public override Task OnDisconnectedAsync(Exception? exception)
+    public override async Task OnDisconnectedAsync(Exception? exception)
     {
-        _tracker.UserDisconnected(Context.ConnectionId);
+        var fullyDisconnectedUserId = _tracker.UserDisconnected(Context.ConnectionId);
         _logger.LogInformation("Conexión {ConnId} terminada.", Context.ConnectionId);
-        return base.OnDisconnectedAsync(exception);
+
+        if (fullyDisconnectedUserId.HasValue)
+        {
+            await UpdateUserPresenceAsync(fullyDisconnectedUserId.Value, false);
+        }
+
+        await base.OnDisconnectedAsync(exception);
+    }
+
+    private async Task UpdateUserPresenceAsync(long userId, bool isOnline)
+    {
+        try
+        {
+            await using var conn = new NpgsqlConnection(_connectionString);
+            await conn.OpenAsync();
+
+            int status = isOnline ? 1 : 0;
+            string statusStr = isOnline ? "Online" : "Offline";
+
+            // Update DB
+            string sql = isOnline 
+                ? @"UPDATE ""credentials"".""users"" SET is_online = true, status = 1 WHERE id = @id RETURNING avatar_url;"
+                : @"UPDATE ""credentials"".""users"" SET is_online = false, status = 0, last_seen = now() WHERE id = @id RETURNING avatar_url;";
+
+            await using var cmd = new NpgsqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("id", userId);
+            
+            var avatarUrlObj = await cmd.ExecuteScalarAsync();
+            var avatarUrl = avatarUrlObj as string ?? "none";
+            if (!string.IsNullOrEmpty(avatarUrl) && avatarUrl != "none")
+            {
+                avatarUrl = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(avatarUrl));
+            }
+            else
+            {
+                avatarUrl = "none";
+            }
+
+            // Notify Postgres
+            // Payload format: "userId:isOnline:userStatus:avatarUrlBase64"
+            string payload = $"{userId}:{isOnline.ToString().ToLower()}:{statusStr}:{avatarUrl}";
+            var json = JsonSerializer.Serialize(new { Type = "USER_PRESENCE", Payload = payload });
+            
+            await using var notifyCmd = new NpgsqlCommand($"NOTIFY sphere_updates, '{json}'", conn);
+            await notifyCmd.ExecuteNonQueryAsync();
+
+            _logger.LogInformation("📢 Presence updated for User {UserId}: {Status}", userId, statusStr);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error actualizando presencia para el usuario {UserId}", userId);
+        }
     }
 
     // ════════════════════════════════════════════════════════════
